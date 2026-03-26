@@ -11,9 +11,11 @@ const float R_COEF = 0.299f;
 const float G_COEF = 0.587f;
 const float B_COEF = 0.114f;
 
+#pragma pack(push, 1)
 typedef struct {
   uint8_t r, g, b;
 } Pixel;
+#pragma pack(pop)
 
 typedef struct {
   int width;
@@ -32,12 +34,9 @@ typedef struct {
 void skip_comments(FILE* fp) {
   int ch;
   while ((ch = fgetc(fp)) != EOF) {
-    if (isspace(ch)) {
-      continue;
-    }
+    if (isspace(ch)) continue;
     if (ch == '#') {
-      while ((ch = fgetc(fp)) != EOF && ch != '\n') {
-      }
+      while ((ch = fgetc(fp)) != EOF && ch != '\n');
     } else {
       ungetc(ch, fp);
       break;
@@ -73,24 +72,19 @@ void process_simd(const Image* input, Image* output, int start_row, int end_row)
     for (; x <= width - 8; x += 8) {
       int idx = y * width + x;
       float r_f[8], g_f[8], b_f[8];
-
       for (int i = 0; i < 8; ++i) {
         r_f[i] = (float)input->data[idx + i].r;
         g_f[i] = (float)input->data[idx + i].g;
         b_f[i] = (float)input->data[idx + i].b;
       }
-
       __m256 r_v = _mm256_loadu_ps(r_f);
       __m256 g_v = _mm256_loadu_ps(g_f);
       __m256 b_v = _mm256_loadu_ps(b_f);
-
       __m256 gray_v = _mm256_add_ps(_mm256_mul_ps(r_v, r_w),
                       _mm256_add_ps(_mm256_mul_ps(g_v, g_w),
                                     _mm256_mul_ps(b_v, b_w)));
-
       float res[8];
       _mm256_storeu_ps(res, gray_v);
-
       for (int i = 0; i < 8; ++i) {
         uint8_t g = (uint8_t)res[i];
         output->data[idx + i] = (Pixel){g, g, g};
@@ -117,102 +111,86 @@ void* thread_worker(void* arg) {
 Image load_ppm(const char* filename) {
   FILE* fp = fopen(filename, "rb");
   Image img = {0, 0, NULL};
-  if (!fp) {
-    return img;
-  }
+  if (!fp) return img;
 
   char magic[3];
   int max_val;
-  if (fscanf(fp, "%2s", magic) != 1) {
-    fclose(fp);
-    return img;
-  }
+  if (fscanf(fp, "%2s", magic) != 1 || magic[1] != '6') { fclose(fp); return img; }
 
   skip_comments(fp);
-  fscanf(fp, "%d", &img.width);
-  skip_comments(fp);
-  fscanf(fp, "%d", &img.height);
+  fscanf(fp, "%d %d", &img.width, &img.height);
   skip_comments(fp);
   fscanf(fp, "%d", &max_val);
   fgetc(fp); 
 
-  img.data = (Pixel*)malloc(img.width * img.height * sizeof(Pixel));
-  fread(img.data, sizeof(Pixel), img.width * img.height, fp);
+  size_t num_pixels = (size_t)img.width * img.height;
+  img.data = (Pixel*)malloc(num_pixels * sizeof(Pixel));
+  if (img.data) fread(img.data, sizeof(Pixel), num_pixels, fp);
   fclose(fp);
   return img;
 }
 
-void save_ppm(const char* filename, const Image* img) {
-  FILE* fp = fopen(filename, "wb");
-  if (!fp) {
-    return;
+bool verify_grayscale(const Image* img) {
+  for (int i = 0; i < img->width * img->height; ++i) {
+    if (img->data[i].r != img->data[i].g || img->data[i].g != img->data[i].b) return false;
   }
-  fprintf(fp, "P6\n%d %d\n255\n", img->width, img->height);
-  fwrite(img->data, sizeof(Pixel), img->width * img->height, fp);
-  fclose(fp);
+  return true;
 }
 
 int main() {
   const char* input_name = "input.ppm";
   Image input = load_ppm(input_name);
-  if (!input.data) {
-    printf("Error: Could not load input image.\n");
-    return 1;
-  }
+  if (!input.data) return 1;
 
-  Image output = {input.width, input.height, (Pixel*)malloc(input.width * input.height * sizeof(Pixel))};
+  Image output = {input.width, input.height, malloc(input.width * input.height * sizeof(Pixel))};
   int num_threads = 4;
   pthread_t threads[4];
   ThreadData td[4];
-  double start, end;
+  double t1, t2, t3, t4, start;
 
-  // 1. Scalar
+  // Scalar
   start = get_time();
   process_scalar(&input, &output, 0, input.height);
-  end = get_time();
-  double t_scalar = end - start;
+  t1 = get_time() - start;
 
-  // 2. SIMD
+  // SIMD only
   start = get_time();
   process_simd(&input, &output, 0, input.height);
-  end = get_time();
-  double t_simd = end - start;
+  t2 = get_time() - start;
 
-  // 3. Multithreading
+  // Multithreading only
   start = get_time();
-  for (int i = 0; i < num_threads; ++i) {
-    int step = input.height / num_threads;
-    td[i] = (ThreadData){&input, &output, i * step, (i == num_threads - 1) ? input.height : (i + 1) * step, false};
+  int step = input.height / num_threads;
+  for (int i = 0; i < num_threads; i++) {
+    td[i] = (ThreadData){&input, &output, i * step, (i == 3) ? input.height : (i + 1) * step, false};
     pthread_create(&threads[i], NULL, thread_worker, &td[i]);
   }
-  for (int i = 0; i < num_threads; ++i) {
-    pthread_join(threads[i], NULL);
-  }
-  end = get_time();
-  double t_mt = end - start;
+  for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+  t3 = get_time() - start;
 
-  // 4. MT + SIMD
+  // Multithreading + SIMD
   start = get_time();
-  for (int i = 0; i < num_threads; ++i) {
+  for (int i = 0; i < num_threads; i++) {
     td[i].use_simd = true;
     pthread_create(&threads[i], NULL, thread_worker, &td[i]);
   }
-  for (int i = 0; i < num_threads; ++i) {
-    pthread_join(threads[i], NULL);
-  }
-  end = get_time();
-  double t_mt_simd = end - start;
+  for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+  t4 = get_time() - start;
 
-  printf("Image size: %d x %d\nThreads used: %d\n\n", input.width, input.height, num_threads);
-  printf("Scalar time: %.6f sec\n", t_scalar);
-  printf("SIMD time: %.6f sec\n", t_simd);
-  printf("Multithreading time: %.6f sec\n", t_mt);
-  printf("Multithreading + SIMD time: %.6f sec\n", t_mt_simd);
+  printf("Image size: %d x %d\n", input.width, input.height);
+  printf("Threads used: %d\n\n", num_threads);
+  printf("Scalar time: %.6f sec\n", t1);
+  printf("SIMD time: %.6f sec\n", t2);
+  printf("Multithreading time: %.6f sec\n", t3);
+  printf("Multithreading + SIMD time: %.6f sec\n\n", t4);
+  printf("Verification: %s\n", verify_grayscale(&output) ? "PASSED" : "FAILED");
+  
+  FILE* fp = fopen("gray_output.ppm", "wb");
+  fprintf(fp, "P6\n%d %d\n255\n", output.width, output.height);
+  fwrite(output.data, sizeof(Pixel), output.width * output.height, fp);
+  fclose(fp);
+  printf("Output image: gray_output.ppm\n");
 
-  save_ppm("gray_output.ppm", &output);
-  printf("\nVerification: PASSED\nOutput image: gray_output.ppm\n");
-
-  free(input.data);
-  free(output.data);
+  free(input.data); free(output.data);
   return 0;
 }
